@@ -1,0 +1,367 @@
+name: Build ZeroFeed APK
+
+# Manual: Actions tab > Build ZeroFeed APK > Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Create app files
+        run: |
+          mkdir -p zerofeed-app/www
+          cat > zerofeed-app/package.json <<'ZF_EOF'
+          {
+            "name": "zerofeed",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^7.0.0",
+              "@capacitor/core": "^7.0.0"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^7.0.0"
+            }
+          }
+          ZF_EOF
+          cat > zerofeed-app/capacitor.config.json <<'ZF_EOF'
+          {
+            "appId": "com.salman.zerofeed",
+            "appName": "ZeroFeed",
+            "webDir": "www",
+            "backgroundColor": "#0a0a0a",
+            "server": {
+              "androidScheme": "https",
+              "allowNavigation": ["cloud.jazzdrive.com.pk", "*.jazzdrive.com.pk"]
+            }
+          }
+          ZF_EOF
+          cat > zerofeed-app/make_icon.py <<'ZF_EOF'
+          # ZeroFeed icon: dark rounded square + white play triangle (Pillow)
+          import os
+          from PIL import Image, ImageDraw
+
+          RES = "android/app/src/main/res"
+          DENS = {"mdpi": (48, 108), "hdpi": (72, 162), "xhdpi": (96, 216),
+                  "xxhdpi": (144, 324), "xxxhdpi": (192, 432)}
+          BG = (10, 10, 10, 255)
+
+          def triangle(d, size, scale):
+              c = size / 2
+              r = size * scale
+              d.polygon([(c - r * 0.55, c - r), (c - r * 0.55, c + r), (c + r * 0.95, c)], fill=(255, 255, 255, 255))
+
+          for name, (legacy, adaptive) in DENS.items():
+              folder = f"{RES}/mipmap-{name}"
+              if not os.path.isdir(folder): continue
+              im = Image.new("RGBA", (legacy, legacy), (0, 0, 0, 0))
+              d = ImageDraw.Draw(im)
+              d.rounded_rectangle([0, 0, legacy - 1, legacy - 1], radius=legacy // 5, fill=BG)
+              triangle(d, legacy, 0.26)
+              im.save(f"{folder}/ic_launcher.png"); im.save(f"{folder}/ic_launcher_round.png")
+              fg = Image.new("RGBA", (adaptive, adaptive), (0, 0, 0, 0))
+              triangle(ImageDraw.Draw(fg), adaptive, 0.17)
+              fg.save(f"{folder}/ic_launcher_foreground.png")
+
+          bg_xml = f"{RES}/values/ic_launcher_background.xml"
+          if os.path.isdir(f"{RES}/values"):
+              open(bg_xml, "w").write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+                                      '    <color name="ic_launcher_background">#0A0A0A</color>\n</resources>\n')
+          print("icon done")
+          ZF_EOF
+          cat > zerofeed-app/www/index.html <<'ZF_EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+          <title>ZeroFeed</title>
+          <meta name="theme-color" content="#0a0a0a">
+          <style>
+            * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+            html, body { height:100%; background:#0a0a0a; color:#f5f5f0; overflow:hidden;
+              font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+            #feed { height:100dvh; width:100vw; overflow-y:scroll; overflow-x:hidden;
+              scroll-snap-type:y mandatory; -webkit-overflow-scrolling:touch; }
+            #feed::-webkit-scrollbar { display:none; }
+            .slide { height:100dvh; width:100vw; scroll-snap-align:start; scroll-snap-stop:always;
+              position:relative; overflow:hidden; background:#000; }
+            .bg { position:absolute; inset:0; background-size:cover; background-position:center; }
+            .bg.thumb::after { content:""; position:absolute; inset:0; background:rgba(0,0,0,.35); }
+            video.v { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; background:#000; }
+            .overlay { position:absolute; left:0; right:0; bottom:0; padding:60px 18px calc(34px + env(safe-area-inset-bottom));
+              background:linear-gradient(to top, rgba(0,0,0,.82), rgba(0,0,0,.4) 60%, transparent); pointer-events:none; }
+            .badge { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.08em; text-transform:uppercase;
+              padding:3px 10px; border-radius:20px; background:rgba(255,255,255,.16); margin-bottom:9px; }
+            .title { font-size:16px; line-height:1.4; font-weight:500; max-width:86%; text-shadow:0 1px 3px rgba(0,0,0,.6);
+              display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden; }
+            .meta { font-size:12px; opacity:.7; margin-top:6px; }
+            .play { position:absolute; top:50%; left:50%; width:84px; height:84px; margin:-42px 0 0 -42px; border-radius:50%;
+              border:none; background:rgba(255,255,255,.2); backdrop-filter:blur(6px); color:#fff; font-size:34px;
+              padding-left:6px; }
+            .play:active { transform:scale(.94); }
+            .open { position:absolute; right:14px; bottom:calc(120px + env(safe-area-inset-bottom)); width:46px; height:46px;
+              border-radius:50%; border:none; background:rgba(255,255,255,.18); color:#fff; font-size:20px; }
+            .seen { position:absolute; top:calc(64px + env(safe-area-inset-top)); right:14px; font-size:11px; padding:3px 9px;
+              border-radius:20px; background:rgba(0,200,120,.85); color:#fff; font-weight:600; }
+            .note { position:absolute; left:0; right:0; top:46%; text-align:center; font-size:13px; opacity:.8; padding:0 30px; }
+            #bar { position:fixed; top:0; left:0; right:0; z-index:10; display:flex; align-items:center; gap:10px;
+              padding:calc(10px + env(safe-area-inset-top)) 14px 10px;
+              background:linear-gradient(to bottom, rgba(0,0,0,.7), transparent); }
+            #brand { font-weight:800; font-size:17px; letter-spacing:.02em; user-select:none; }
+            #count { font-size:12px; opacity:.7; flex:1; }
+            .ib { width:38px; height:38px; border-radius:50%; border:none; background:rgba(255,255,255,.14); color:#fff; font-size:17px; }
+            .ib.on { background:rgba(0,200,120,.8); }
+            #empty { position:fixed; inset:0; display:none; align-items:center; justify-content:center; text-align:center;
+              padding:30px; line-height:1.6; opacity:.85; }
+            #toast { position:fixed; left:50%; bottom:calc(30px + env(safe-area-inset-bottom)); transform:translateX(-50%);
+              background:rgba(255,255,255,.92); color:#111; padding:9px 16px; border-radius:20px; font-size:13px;
+              z-index:20; display:none; max-width:86vw; text-align:center; }
+          </style>
+          </head>
+          <body>
+          <div id="bar">
+            <div id="brand">ZeroFeed</div>
+            <div id="count"></div>
+            <button class="ib" id="hideBtn" title="Dekhi hui chhupao">&#128065;</button>
+            <button class="ib" id="refBtn" title="Refresh">&#8635;</button>
+          </div>
+          <div id="feed"></div>
+          <div id="empty"></div>
+          <div id="toast"></div>
+
+          <script>
+          const PAGES = 'https://salmanbot248.github.io/jazz-24-7-bot-tg/feed.json';
+          const RAW   = 'https://raw.githubusercontent.com/salmanbot248/jazz-24-7-bot-tg/main/feed.json';
+          const K = { feed: 'zf_feed', seen: 'zf_seen', ret: 'zf_ret', url: 'zf_url', hide: 'zf_hide' };
+
+          const $ = (id) => document.getElementById(id);
+          const store = {
+            get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+            set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+            del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+          };
+
+          let items = [];
+          let seen = new Set(store.get(K.seen, []));
+          let hideSeen = store.get(K.hide, false);
+
+          function toast(msg) {
+            const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+            clearTimeout(toast.t); toast.t = setTimeout(() => { t.style.display = 'none'; }, 2600);
+          }
+
+          function normalize(data) {
+            const arr = Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : []);
+            return arr.filter((x) => x && typeof x.url === 'string' && x.url).map((x) => ({
+              url: x.url, title: String(x.title || 'Video'), platform: String(x.platform || 'video'),
+              added: x.added || '', thumb: x.thumb || '', direct: x.direct || ''
+            })).sort((a, b) => String(b.added).localeCompare(String(a.added)));
+          }
+
+          async function fetchJson(url) {
+            const ctl = new AbortController();
+            const timer = setTimeout(() => ctl.abort(), 12000);
+            try {
+              const r = await fetch(url + (url.includes('?') ? '&' : '?') + 't=' + Date.now(), { signal: ctl.signal, cache: 'no-store' });
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              return await r.json();
+            } finally { clearTimeout(timer); }
+          }
+
+          async function loadFeed() {
+            const sources = [store.get(K.url, ''), PAGES, RAW].filter(Boolean);
+            for (const src of sources) {
+              try {
+                const data = await fetchJson(src);
+                const list = normalize(data);
+                store.set(K.feed, data);
+                return { list, live: true };
+              } catch (e) { /* agla source */ }
+            }
+            return { list: normalize(store.get(K.feed, [])), live: false };
+          }
+
+          function timeAgo(iso) {
+            const t = Date.parse(iso); if (!t) return '';
+            const m = Math.floor((Date.now() - t) / 60000);
+            if (m < 60) return Math.max(m, 1) + ' min pehle';
+            if (m < 1440) return Math.floor(m / 60) + ' ghante pehle';
+            return Math.floor(m / 1440) + ' din pehle';
+          }
+
+          function gradientFor(s) {
+            let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
+            return 'linear-gradient(160deg, hsl(' + h + ',55%,22%), hsl(' + ((h + 50) % 360) + ',60%,10%))';
+          }
+
+          function openItem(item, index) {
+            seen.add(item.url); store.set(K.seen, Array.from(seen));
+            store.set(K.ret, item.url);
+            location.href = item.url;
+          }
+
+          function visibleItems() { return hideSeen ? items.filter((x) => !seen.has(x.url)) : items; }
+
+          let observer = null;
+          function render(scrollToUrl) {
+            const feed = $('feed'); feed.innerHTML = '';
+            const list = visibleItems();
+            $('hideBtn').classList.toggle('on', hideSeen);
+            $('empty').style.display = list.length ? 'none' : 'flex';
+            if (!list.length) {
+              $('empty').textContent = items.length ? 'Sab videos dekh li! Upar wale button se dobara dikhao.'
+                : 'Abhi feed khali hai. Telegram bot ko link bhejo, video yahan aa jayegi.';
+              $('count').textContent = '';
+              return;
+            }
+            if (observer) observer.disconnect();
+            observer = new IntersectionObserver((entries) => {
+              entries.forEach((en) => {
+                const v = en.target.querySelector('video.v');
+                if (en.isIntersecting && en.intersectionRatio > 0.6) {
+                  $('count').textContent = (Number(en.target.dataset.i) + 1) + ' / ' + list.length;
+                  if (v) { if (!v.src) v.src = v.dataset.src; v.play().catch(() => {}); }
+                } else if (v) { v.pause(); }
+              });
+            }, { threshold: [0, 0.6, 1] });
+
+            list.forEach((item, i) => {
+              const s = document.createElement('section'); s.className = 'slide'; s.dataset.i = i;
+              const bg = document.createElement('div'); bg.className = 'bg';
+              if (item.thumb) { bg.classList.add('thumb'); bg.style.backgroundImage = 'url("' + item.thumb.replace(/"/g, '%22') + '")'; }
+              else bg.style.background = gradientFor(item.title);
+              s.appendChild(bg);
+
+              if (item.direct) {
+                const v = document.createElement('video'); v.className = 'v'; v.dataset.src = item.direct;
+                v.playsInline = true; v.loop = true; v.muted = true; v.preload = 'none';
+                v.onerror = () => { v.remove(); const n = document.createElement('div'); n.className = 'note';
+                  n.textContent = 'Direct play nahi chali — neeche wale button se kholo'; s.appendChild(n); addPlay(s, item, i); };
+                v.addEventListener('click', () => { v.muted = !v.muted; toast(v.muted ? 'Awaz band' : 'Awaz on'); });
+                s.appendChild(v);
+                const ob = document.createElement('button'); ob.className = 'open'; ob.innerHTML = '&#8599;';
+                ob.onclick = () => openItem(item, i); s.appendChild(ob);
+              } else { addPlay(s, item, i); }
+
+              const ov = document.createElement('div'); ov.className = 'overlay';
+              const b = document.createElement('span'); b.className = 'badge'; b.textContent = item.platform;
+              const t = document.createElement('div'); t.className = 'title'; t.textContent = item.title;
+              const m = document.createElement('div'); m.className = 'meta'; m.textContent = timeAgo(item.added);
+              ov.append(b, t, m); s.appendChild(ov);
+              if (seen.has(item.url)) { const sn = document.createElement('div'); sn.className = 'seen'; sn.textContent = 'Dekh li'; s.appendChild(sn); }
+              feed.appendChild(s); observer.observe(s);
+            });
+            $('count').textContent = '1 / ' + list.length;
+
+            if (scrollToUrl) {
+              const idx = list.findIndex((x) => x.url === scrollToUrl);
+              const target = Math.min(idx + 1, list.length - 1);   // dekhi hui ke baad agli
+              if (idx >= 0) requestAnimationFrame(() => feed.scrollTo({ top: target * feed.clientHeight, behavior: 'instant' }));
+            }
+          }
+
+          function addPlay(slide, item, i) {
+            const p = document.createElement('button'); p.className = 'play'; p.innerHTML = '&#9654;';
+            p.onclick = () => openItem(item, i); slide.appendChild(p);
+            slide.addEventListener('click', (e) => { if (e.target === slide || e.target.classList.contains('bg')) openItem(item, i); });
+          }
+
+          async function refresh(silent) {
+            if (!silent) toast('Feed refresh ho rahi hai...');
+            const { list, live } = await loadFeed();
+            items = list;
+            render(null);
+            if (!silent) toast(live ? list.length + ' videos' : 'Internet nahi — purani feed dikha raha hun');
+          }
+
+          $('refBtn').onclick = () => refresh(false);
+          $('hideBtn').onclick = () => { hideSeen = !hideSeen; store.set(K.hide, hideSeen); render(null); };
+
+          // Title ko 1 second dabao = feed ka URL badlo (aam taur par zaroorat nahi)
+          let pressTimer = null;
+          $('brand').addEventListener('touchstart', () => {
+            pressTimer = setTimeout(() => {
+              const u = prompt('Feed.json ka URL (khali = default):', store.get(K.url, ''));
+              if (u !== null) { if (u.trim()) store.set(K.url, u.trim()); else store.del(K.url); refresh(false); }
+            }, 1000);
+          });
+          ['touchend', 'touchmove'].forEach((ev) => $('brand').addEventListener(ev, () => clearTimeout(pressTimer)));
+
+          (async () => {
+            const cached = normalize(store.get(K.feed, []));
+            const back = store.get(K.ret, null); store.del(K.ret);
+            if (cached.length) { items = cached; render(back); }          // foran purani feed dikhao
+            const { list, live } = await loadFeed();
+            if (live) { items = list; render(back || null); }
+            else if (!cached.length) { items = list; render(null); toast('Feed load nahi hui — internet check karo'); }
+          })();
+          </script>
+          </body>
+          </html>
+          ZF_EOF
+
+      - name: Install Capacitor and add Android project
+        working-directory: zerofeed-app
+        run: |
+          npm install
+          npx cap add android
+
+      - name: App icon (optional)
+        working-directory: zerofeed-app
+        continue-on-error: true
+        run: |
+          pip install pillow
+          python make_icon.py
+
+      - name: Sync web assets
+        working-directory: zerofeed-app
+        run: npx cap sync android
+
+      - name: Android SDK licenses and platform
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" > /dev/null || true
+
+      - name: Build debug APK
+        working-directory: zerofeed-app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Collect APK
+        run: cp zerofeed-app/android/app/build/outputs/apk/debug/app-debug.apk ZeroFeed.apk
+
+      - name: Save APK as artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeroFeed-APK
+          path: ZeroFeed.apk
+          if-no-files-found: warn
+
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: zerofeed-apk
+          name: ZeroFeed APK (latest)
+          body: "Sab se naya ZeroFeed APK. Download karke install karo (Install unknown apps allow karna padega)."
+          files: ZeroFeed.apk

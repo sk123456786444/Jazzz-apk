@@ -1,0 +1,155 @@
+name: Sniff Share Link
+
+# Actions > Sniff Share Link > Run workflow > JazzDrive share link paste karo
+on:
+  workflow_dispatch:
+    inputs:
+      share_url:
+        description: 'JazzDrive share link (https://cloud.jazzdrive.com.pk/share/...)'
+        required: true
+
+jobs:
+  sniff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright requests
+          playwright install --with-deps chromium
+
+      - name: Sniff the share page
+        env:
+          SHARE_URL: ${{ inputs.share_url }}
+        run: |
+          cat > sniff.py <<'SNIFF_EOF'
+          import os, re, asyncio, json
+          from urllib.parse import urlparse, parse_qs
+          import requests
+          from playwright.async_api import async_playwright
+
+          URL = os.environ["SHARE_URL"].strip()
+          MOBILE_UA = ("Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+
+          def redact(s):
+              s = re.sub(r"(?<!\d)(?:\+?92|0)3\d{9}(?!\d)", "[NUMBER]", s)
+              s = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "[EMAIL]", s)
+              return s
+
+          def find_token(bodies, token, page_url, doc_text):
+              """Token (k=...) kis response ya request mein pehli baar aaya? Return list of strings."""
+              head = token[:30]
+              hits = []
+              if head in page_url: hits.append("PAGE URL mein")
+              if head in (doc_text or ""):
+                  i = doc_text.index(head)
+                  hits.append("PAGE HTML mein: ..." + doc_text[max(0, i - 120): i + 120].replace("\n", " ") + "...")
+              for b in bodies:
+                  txt = b["text"] or ""
+                  if head in txt:
+                      i = txt.index(head)
+                      hits.append(f"{b['method']} {b['status']} {b['url'][:200]}\n   POST data: {(b['post'] or '-')[:300]}\n"
+                                  f"   Response snippet: ...{txt[max(0, i - 160): i + 160]}...")
+              return hits
+
+          async def main():
+              media, apis, bodies, media_hdrs = [], [], [], []
+              doc_text = ""
+              async with async_playwright() as p:
+                  b = await p.chromium.launch(args=["--no-sandbox", "--autoplay-policy=no-user-gesture-required"])
+                  ctx = await b.new_context(viewport={"width": 412, "height": 915}, user_agent=MOBILE_UA, locale="en-US")
+                  page = await ctx.new_page()
+
+                  async def on_resp(r):
+                      nonlocal doc_text
+                      try:
+                          req = r.request
+                          ct = (r.headers.get("content-type") or "").lower()
+                          line = f"{req.method} {r.status} [{req.resource_type}] {ct[:35]} {r.url[:200]}"
+                          if ct.startswith(("video", "audio")) or "mpegurl" in ct or req.resource_type == "media":
+                              media.append(line)
+                              media_hdrs.append(sorted(k.lower() for k in req.headers.keys()))
+                          elif req.resource_type in ("xhr", "fetch", "document", "script"):
+                              if req.resource_type in ("xhr", "fetch"): apis.append(line)
+                              if "jazzdrive" in r.url or req.resource_type == "document":
+                                  txt = ""
+                                  try: txt = (await r.text())[:300000]
+                                  except Exception: pass
+                                  if req.resource_type == "document" and r.url.startswith(URL[:40]): doc_text = txt
+                                  bodies.append({"method": req.method, "status": r.status, "url": r.url,
+                                                 "post": req.post_data, "text": txt})
+                      except Exception:
+                          pass
+
+                  page.on("response", on_resp)
+                  await page.goto(URL, wait_until="domcontentloaded", timeout=90000)
+                  await asyncio.sleep(7)
+                  for sel in ["button:has-text('Accept All')", "text=Accept All"]:
+                      try:
+                          await page.locator(sel).first.click(timeout=3000); break
+                      except Exception:
+                          pass
+                  await asyncio.sleep(3)
+                  try:
+                      await page.evaluate("document.querySelectorAll('video').forEach(v => { v.muted = true; v.play().catch(()=>{}); })")
+                  except Exception:
+                      pass
+                  await asyncio.sleep(10)
+                  try:
+                      videos = await page.evaluate(
+                          "() => Array.from(document.querySelectorAll('video')).map(v => ({src: v.currentSrc || v.src || '', ready: v.readyState}))")
+                  except Exception:
+                      videos = []
+                  await page.screenshot(path="share.png")
+                  await b.close()
+
+              out = ["## Share page sniff v2", "", f"Page URL: {URL}", ""]
+              vsrc = next((v["src"] for v in videos if v.get("src", "").startswith("http")), "")
+              out += ["### 1. Direct video URL", "```", vsrc or "(video src nahi mila)", "```"]
+
+              token = (parse_qs(urlparse(vsrc).query).get("k") or [""])[0] if vsrc else ""
+              out += ["", "### 2. Token (k=) kahan se aaya", "```"]
+              if token:
+                  hits = find_token(bodies, token, URL, doc_text)
+                  out.append("\n\n".join(hits) if hits else "Token kisi response/page mein nahi mila (shayad JS ne khud banaya)")
+              else:
+                  out.append("(video URL mein k= token nahi)")
+              out.append("```")
+
+              out += ["", "### 3. Anonymous test (bina cookie ke seedha download)", "```"]
+              if vsrc:
+                  try:
+                      r = requests.get(vsrc, headers={"Range": "bytes=0-1023", "User-Agent": MOBILE_UA}, timeout=25)
+                      out.append(f"HTTP {r.status_code} | type={r.headers.get('content-type')} | "
+                                 f"range={r.headers.get('content-range')} | bytes={len(r.content)}")
+                  except Exception as e:
+                      out.append(f"Test fail: {e}")
+              else:
+                  out.append("(skip)")
+              out.append("```")
+
+              out += ["", "### 4. Video request ke headers (sirf naam)", "```", redact(json.dumps(media_hdrs[:2])), "```",
+                      "", f"### 5. Media requests ({len(media)})", "```", redact("\n".join(media[:6]) or "(koi nahi)"), "```",
+                      "", f"### 6. API requests ({len(apis)})", "```", redact("\n".join(apis[:40]) or "(koi nahi)"), "```"]
+              text = "\n".join(out) + "\n"
+              open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8").write(text)
+              print(text)
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          SNIFF_EOF
+          python sniff.py
+
+      - name: Save screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: share-screenshot
+          path: share.png
+          if-no-files-found: ignore

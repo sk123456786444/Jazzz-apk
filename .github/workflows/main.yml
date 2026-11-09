@@ -1,1 +1,13 @@
+name: Build APK (manual)
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-apk.yml
+    permissions:
+      contents: write

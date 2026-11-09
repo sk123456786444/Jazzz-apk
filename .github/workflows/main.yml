@@ -326,6 +326,22 @@ jobs:
           npm install
           npx cap add android
 
+      - name: Increase Gradle download timeout
+        working-directory: zerofeed-app
+        run: |
+          PROPS="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$PROPS" ]; then
+            sed -i 's/gradle-8\.11\.1-all\.zip/gradle-8.11.1-bin.zip/' "$PROPS"
+            if grep -q '^networkTimeout=' "$PROPS"; then
+              sed -i 's/^networkTimeout=.*/networkTimeout=120000/' "$PROPS"
+            else
+              echo 'networkTimeout=120000' >> "$PROPS"
+            fi
+          else
+            echo "gradle-wrapper.properties not found at $PROPS"
+            exit 1
+          fi
+
       - name: App icon (optional)
         working-directory: zerofeed-app
         continue-on-error: true

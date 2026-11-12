@@ -1,0 +1,807 @@
+name: Build ZeroFeed APK
+
+# Manual: Actions tab > Build ZeroFeed APK > Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Create app files
+        run: |
+          mkdir -p zerofeed-app/www
+          cat > zerofeed-app/package.json <<'ZF_EOF'
+          {
+            "name": "zerofeed",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^7.0.0",
+              "@capacitor/core": "^7.0.0",
+              "@capacitor/filesystem": "^7.0.0",
+              "@capacitor/share": "^7.0.0"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^7.0.0"
+            }
+          }
+          ZF_EOF
+          cat > zerofeed-app/capacitor.config.json <<'ZF_EOF'
+          {
+            "appId": "com.salman.zerofeed",
+            "appName": "ZeroFeed",
+            "webDir": "www",
+            "backgroundColor": "#000000",
+            "android": {
+              "adjustMarginsForEdgeToEdge": "force"
+            },
+            "server": {
+              "androidScheme": "https",
+              "allowNavigation": [
+                "cloud.jazzdrive.com.pk",
+                "*.jazzdrive.com.pk"
+              ]
+            },
+            "plugins": {
+              "CapacitorHttp": {
+                "enabled": true
+              }
+            }
+          }
+          ZF_EOF
+          cat > zerofeed-app/make_icon.py <<'ZF_EOF'
+          # ZeroFeed icon: dark rounded square + white play triangle (Pillow)
+          import os
+          from PIL import Image, ImageDraw
+
+          RES = "android/app/src/main/res"
+          DENS = {"mdpi": (48, 108), "hdpi": (72, 162), "xhdpi": (96, 216),
+                  "xxhdpi": (144, 324), "xxxhdpi": (192, 432)}
+          BG = (10, 10, 10, 255)
+
+          def triangle(d, size, scale):
+              c = size / 2
+              r = size * scale
+              d.polygon([(c - r * 0.55, c - r), (c - r * 0.55, c + r), (c + r * 0.95, c)], fill=(255, 255, 255, 255))
+
+          for name, (legacy, adaptive) in DENS.items():
+              folder = f"{RES}/mipmap-{name}"
+              if not os.path.isdir(folder): continue
+              im = Image.new("RGBA", (legacy, legacy), (0, 0, 0, 0))
+              d = ImageDraw.Draw(im)
+              d.rounded_rectangle([0, 0, legacy - 1, legacy - 1], radius=legacy // 5, fill=BG)
+              triangle(d, legacy, 0.26)
+              im.save(f"{folder}/ic_launcher.png"); im.save(f"{folder}/ic_launcher_round.png")
+              fg = Image.new("RGBA", (adaptive, adaptive), (0, 0, 0, 0))
+              triangle(ImageDraw.Draw(fg), adaptive, 0.17)
+              fg.save(f"{folder}/ic_launcher_foreground.png")
+
+          bg_xml = f"{RES}/values/ic_launcher_background.xml"
+          if os.path.isdir(f"{RES}/values"):
+              open(bg_xml, "w").write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+                                      '    <color name="ic_launcher_background">#0A0A0A</color>\n</resources>\n')
+          print("icon done")
+          ZF_EOF
+          cat > zerofeed-app/www/index.html <<'ZF_EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+          <title>ZeroFeed</title>
+          <meta name="theme-color" content="#000000">
+          <style>
+            :root { --st: env(safe-area-inset-top, 0px); --sb: env(safe-area-inset-bottom, 0px);
+                    --topH: calc(var(--st) + 48px); --navH: calc(56px + var(--sb)); }
+            * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+            html, body { height:100%; background:#000; color:#fff; overflow:hidden; overscroll-behavior:none;
+              font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+            button { font-family:inherit; color:inherit; }
+            svg { width:100%; height:100%; fill:currentColor; display:block; }
+
+            /* ---------- Top bar ---------- */
+            #top { position:fixed; top:0; left:0; right:0; height:var(--topH); padding-top:var(--st); z-index:30;
+              background:#000; display:flex; align-items:center; justify-content:center; }
+            #tabs { display:flex; gap:22px; }
+            .tab { font-size:16.5px; font-weight:600; color:rgba(255,255,255,.62); background:none; border:none; padding:10px 2px; position:relative; }
+            .tab.on { color:#fff; }
+            .tab.on::after { content:''; position:absolute; left:50%; bottom:2px; width:26px; height:3px; border-radius:2px; background:#fff; transform:translateX(-50%); }
+            #srchBtn { position:absolute; right:10px; bottom:6px; width:36px; height:36px; background:none; border:none; padding:5px; }
+            #srchBox { display:none; align-items:center; gap:8px; width:100%; padding:0 12px; }
+            #srchBox input { flex:1; height:36px; border-radius:18px; border:none; outline:none; background:rgba(255,255,255,.14); color:#fff; padding:0 16px; font-size:15px; }
+            #srchBox button { background:none; border:none; font-size:15px; font-weight:600; padding:6px; }
+            #top.searching #tabs, #top.searching #srchBtn { display:none; }
+            #top.searching #srchBox { display:flex; }
+
+            /* ---------- Feed ---------- */
+            #feed { position:fixed; top:var(--topH); bottom:var(--navH); left:0; right:0; overflow-y:scroll; overflow-x:hidden;
+              scroll-snap-type:y mandatory; -webkit-overflow-scrolling:touch; background:#000; }
+            #feed::-webkit-scrollbar { display:none; }
+            .slide { height:100%; width:100%; scroll-snap-align:start; scroll-snap-stop:always; position:relative; overflow:hidden; background:#000;
+              user-select:none; -webkit-user-select:none; }
+            .bg { position:absolute; inset:0; background-size:cover; background-position:center; filter:blur(0px); }
+            video.v { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; background:transparent; }
+            #feed.contain video.v { object-fit:contain; }
+
+            .overlay { position:absolute; left:0; right:0; bottom:22px; padding:70px 84px 8px 14px; pointer-events:none;
+              background:linear-gradient(to top, rgba(0,0,0,.72), rgba(0,0,0,.28) 60%, transparent); }
+            .who { font-size:17px; font-weight:700; text-shadow:0 1px 3px rgba(0,0,0,.7); margin-bottom:6px; }
+            .title { font-size:14.5px; line-height:1.4; font-weight:400; text-shadow:0 1px 3px rgba(0,0,0,.7);
+              display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; word-break:break-word; }
+            .meta { font-size:12px; opacity:.75; margin-top:6px; }
+
+            .side { position:absolute; right:6px; bottom:46px; display:flex; flex-direction:column; align-items:center; gap:14px; }
+            .ab { background:none; border:none; display:flex; flex-direction:column; align-items:center; gap:3px; width:56px;
+              font-size:11.5px; font-weight:600; text-shadow:0 1px 3px rgba(0,0,0,.8); }
+            .ab i { display:block; width:34px; height:34px; filter:drop-shadow(0 1px 3px rgba(0,0,0,.7)); transition:transform .15s; }
+            .ab:active i { transform:scale(.88); }
+            .ab.on i { color:#fe2c55; }
+            .ab.busy i { opacity:.5; }
+
+            /* scrub bar */
+            .scrub { position:absolute; left:0; right:0; bottom:0; height:30px; touch-action:none; z-index:3; }
+            .track { position:absolute; left:12px; right:12px; bottom:12px; height:3px; border-radius:2px; background:rgba(255,255,255,.28); transition:height .12s; }
+            .fill { height:100%; width:0; background:#fff; border-radius:2px; position:relative; }
+            .knob { position:absolute; right:-6px; top:50%; width:12px; height:12px; margin-top:-6px; border-radius:50%; background:#fff; display:none; }
+            .slide.scrubbing .track { height:6px; bottom:10px; }
+            .slide.scrubbing .knob { display:block; }
+            .tip { position:absolute; left:0; right:0; bottom:44px; text-align:center; font-size:22px; font-weight:700; text-shadow:0 1px 4px #000; display:none; pointer-events:none; z-index:3; }
+            .slide.scrubbing .tip { display:block; }
+
+            /* centre: notes, flash, pause controls */
+            .note { position:absolute; left:0; right:0; top:42%; text-align:center; font-size:13px; padding:0 34px; line-height:1.5; white-space:pre-line;
+              text-shadow:0 1px 4px #000; pointer-events:none; }
+            .flash { position:absolute; top:46%; left:50%; min-width:78px; height:78px; padding:0 18px; transform:translate(-50%,-50%) scale(.8); border-radius:40px;
+              background:rgba(0,0,0,.55); color:#fff; font-size:22px; font-weight:700; display:flex; align-items:center; justify-content:center;
+              opacity:0; transition:opacity .2s, transform .2s; pointer-events:none; z-index:2; }
+            .flash.show { opacity:1; transform:translate(-50%,-50%) scale(1); }
+            .flash svg { width:38px; height:38px; }
+            .pc { position:absolute; top:46%; left:0; right:0; transform:translateY(-50%); display:none; align-items:center; justify-content:center; gap:34px; z-index:2; }
+            .slide.paused .pc { display:flex; }
+            .pc button { width:54px; height:54px; border-radius:50%; border:none; background:rgba(0,0,0,.5); font-size:13px; font-weight:700;
+              display:flex; align-items:center; justify-content:center; backdrop-filter:blur(4px); }
+            .pc button.big { width:78px; height:78px; font-size:34px; padding-left:5px; }
+            .chip { position:absolute; top:12px; left:50%; transform:translateX(-50%); padding:5px 14px; border-radius:16px; background:rgba(0,0,0,.6);
+              font-size:13px; font-weight:700; display:none; z-index:2; }
+            .slide.fast .chip { display:block; }
+            .play { position:absolute; top:54%; left:50%; width:74px; height:74px; margin:-37px 0 0 -37px; border-radius:50%; border:none;
+              background:rgba(255,255,255,.22); backdrop-filter:blur(6px); font-size:30px; padding-left:6px; display:none; z-index:2; }
+            .slide.failed .play { display:block; }
+            .heartpop { position:absolute; width:96px; height:96px; margin:-48px 0 0 -48px; color:#fe2c55; pointer-events:none; z-index:2;
+              opacity:0; transform:scale(.4); }
+            .heartpop.go { animation:pop .7s ease-out; }
+            @keyframes pop { 0%{opacity:0;transform:scale(.4)} 25%{opacity:1;transform:scale(1.15)} 60%{opacity:1;transform:scale(1)} 100%{opacity:0;transform:scale(1.1) translateY(-20px)} }
+
+            /* ---------- Bottom nav ---------- */
+            #nav { position:fixed; bottom:0; left:0; right:0; height:var(--navH); padding-bottom:var(--sb); z-index:30; background:#000;
+              border-top:1px solid rgba(255,255,255,.07); display:flex; justify-content:space-around; align-items:center; }
+            .nb { background:none; border:none; display:flex; flex-direction:column; align-items:center; gap:2px; width:25%; font-size:11px; font-weight:600; color:rgba(255,255,255,.7); }
+            .nb i { display:block; width:26px; height:26px; }
+            .nb.on { color:#fff; }
+
+            /* ---------- Empty / toast / sheet ---------- */
+            #empty { position:fixed; top:var(--topH); bottom:var(--navH); left:0; right:0; display:none; align-items:center; justify-content:center; text-align:center;
+              padding:30px; line-height:1.6; opacity:.85; white-space:pre-line; font-size:14px; }
+            #toast { position:fixed; left:50%; bottom:calc(var(--navH) + 14px); transform:translateX(-50%); background:rgba(255,255,255,.94); color:#111;
+              padding:9px 16px; border-radius:20px; font-size:13px; z-index:60; display:none; max-width:88vw; text-align:center; word-break:break-word; }
+            #shade { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:40; display:none; }
+            #sheet { position:fixed; left:0; right:0; bottom:0; z-index:41; background:#161616; border-radius:18px 18px 0 0; padding:10px 0 calc(14px + var(--sb));
+              transform:translateY(105%); transition:transform .25s; max-height:78vh; overflow-y:auto; }
+            #sheet.open { transform:none; }
+            #sheet .grab { width:38px; height:4px; border-radius:2px; background:rgba(255,255,255,.25); margin:2px auto 8px; }
+            .row { display:flex; align-items:center; justify-content:space-between; width:100%; padding:15px 20px; background:none; border:none; font-size:15px; text-align:left; }
+            .row span:last-child { opacity:.65; font-size:13.5px; margin-left:12px; text-align:right; }
+            .row.danger { color:#ff6b6b; }
+            .ver { text-align:center; font-size:11.5px; opacity:.4; padding:8px 0 2px; }
+          </style>
+          </head>
+          <body>
+
+          <div id="top">
+            <div id="tabs">
+              <button class="tab on" data-tab="all">For You</button>
+              <button class="tab" data-tab="unseen">Unseen</button>
+              <button class="tab" data-tab="saved">Saved</button>
+            </div>
+            <button id="srchBtn" aria-label="Search"><svg viewBox="0 0 24 24"><path d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 14 15.5l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"/></svg></button>
+            <div id="srchBox"><input id="srchIn" type="search" placeholder="Search videos" autocomplete="off"><button id="srchX">Cancel</button></div>
+          </div>
+
+          <div id="feed"></div>
+          <div id="empty"></div>
+
+          <div id="nav">
+            <button class="nb on" id="nbHome"><i><svg viewBox="0 0 24 24"><path d="M12 3 2 12h3v8h5v-6h4v6h5v-8h3L12 3z"/></svg></i>Home</button>
+            <button class="nb" id="nbRef"><i><svg viewBox="0 0 24 24"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h7V4l-2.3 2.3z"/></svg></i>Refresh</button>
+            <button class="nb" id="nbFit"><i><svg viewBox="0 0 24 24"><path d="M4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4zM4 14h2v4h4v2H4v-6zm14 0h2v4h-4v2h6v-6z"/></svg></i><span id="fitLbl">Fill</span></button>
+            <button class="nb" id="nbSet"><i><svg viewBox="0 0 24 24"><path d="M4 6h10v2H4V6zm0 5h6v2H4v-2zm0 5h12v2H4v-2zM17 5h2v4h2v2h-6V9h2V5zm-3 7h2v4h2v2h-6v-2h2v-4z"/></svg></i>Settings</button>
+          </div>
+
+          <div id="toast"></div>
+          <div id="shade"></div>
+          <div id="sheet"><div class="grab"></div><div id="sheetBody"></div><div class="ver">ZeroFeed v2.0</div></div>
+
+          <script>
+          const PAGES = 'https://salmanbot248.github.io/jazz-24-7-bot-tg/feed.json';
+          const RAW   = 'https://raw.githubusercontent.com/salmanbot248/jazz-24-7-bot-tg/main/feed.json';
+          const JD    = 'https://cloud.jazzdrive.com.pk';
+          const K = { feed:'zf_feed', seen:'zf_seen', ret:'zf_ret', url:'zf_url', next:'zf_next', sound:'zf_sound',
+                      fit:'zf_fit', speed:'zf_speed', saved:'zf_saved' };
+          const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+
+          const $ = (id) => document.getElementById(id);
+          const store = {
+            get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+            set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+            del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+          };
+
+          let items = [];
+          let seen   = new Set(store.get(K.seen, []));
+          let saved  = new Set(store.get(K.saved, []));
+          let autoNext = store.get(K.next, false);
+          let soundOn  = store.get(K.sound, true);
+          let fitMode  = store.get(K.fit, 'cover');          // cover = poori screen (TikTok jaisa), contain = poori video
+          let speed    = store.get(K.speed, 1);
+          let tab = 'all', query = '';
+          let lastDiag = [];
+
+          const ICON = {
+            heart: '<svg viewBox="0 0 24 24"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 2.9 4.5 6.6 4.5c2 0 3.6 1.1 5.4 3 1.8-1.9 3.4-3 5.4-3 3.7 0 5.7 3.9 4.2 7.3C19.5 16.4 12 21 12 21z"/></svg>',
+            down:  '<svg viewBox="0 0 24 24"><path d="M11 3h2v10.2l3.6-3.6 1.4 1.4-6 6-6-6 1.4-1.4 3.6 3.6V3zM5 19h14v2H5z"/></svg>',
+            share: '<svg viewBox="0 0 24 24"><path d="M18 16a3 3 0 0 0-2.4 1.2L8.9 13.4a3 3 0 0 0 0-2.8l6.6-3.8A3 3 0 1 0 15 5.4a3 3 0 0 0 .1.8L8.6 10A3 3 0 1 0 8.6 14l6.5 3.8A3 3 0 1 0 18 16z"/></svg>',
+            volOn: '<svg viewBox="0 0 24 24"><path d="M3 10v4h4l5 4V6L7 10H3zm13.5 2a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4zM14 3.2v2.1a7 7 0 0 1 0 13.4v2.1a9 9 0 0 0 0-17.6z"/></svg>',
+            volOff:'<svg viewBox="0 0 24 24"><path d="M3 10v4h4l5 4V6L7 10H3zm13.6 2 2.4-2.4-1.4-1.4-2.4 2.4-2.4-2.4-1.4 1.4 2.4 2.4-2.4 2.4 1.4 1.4 2.4-2.4 2.4 2.4 1.4-1.4z"/></svg>',
+            speed: '<svg viewBox="0 0 24 24"><path d="M12 4a10 10 0 0 0-9.8 12h2.1A8 8 0 1 1 19.7 16h2.1A10 10 0 0 0 12 4zm4.2 3.8-4.6 5.2a2 2 0 1 0 1.5 1.3l3.1-6.5z"/></svg>',
+            play:  '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>',
+            pause: '<svg viewBox="0 0 24 24"><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>'
+          };
+
+          function toast(msg, ms) {
+            const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+            clearTimeout(toast.t); toast.t = setTimeout(() => { t.style.display = 'none'; }, ms || 2400);
+          }
+          function fmt(t) {
+            if (!isFinite(t) || t < 0) t = 0;
+            const m = Math.floor(t / 60), s = Math.floor(t % 60);
+            return m + ':' + (s < 10 ? '0' : '') + s;
+          }
+
+          /* ---------- Feed data ---------- */
+          function normalize(data) {
+            const arr = Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : []);
+            return arr.filter((x) => x && typeof x.url === 'string' && x.url).map((x) => ({
+              url: x.url, title: String(x.title || 'Video'), platform: String(x.platform || 'video'),
+              added: x.added || '', thumb: x.thumb || '', direct: x.direct || ''
+            })).sort((a, b) => String(b.added).localeCompare(String(a.added)));
+          }
+          async function fetchJson(url) {
+            const ctl = new AbortController();
+            const timer = setTimeout(() => ctl.abort(), 12000);
+            try {
+              const r = await fetch(url + (url.includes('?') ? '&' : '?') + 't=' + Date.now(), { signal: ctl.signal, cache: 'no-store' });
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              return await r.json();
+            } finally { clearTimeout(timer); }
+          }
+          async function loadFeed() {
+            const sources = [store.get(K.url, ''), PAGES, RAW].filter(Boolean);
+            const diag = ['App v2.0' + (navigator.onLine ? '' : ' (internet band lag raha hai)')];
+            for (const src of sources) {
+              const name = src === PAGES ? 'Pages' : (src === RAW ? 'Raw' : 'Custom URL');
+              try {
+                const data = await fetchJson(src);
+                const list = normalize(data);
+                store.set(K.feed, data);
+                diag.push(name + ': OK');
+                lastDiag = diag;
+                return { list, live: true };
+              } catch (e) { diag.push(name + ': ' + (e && e.message ? e.message : 'error')); }
+            }
+            lastDiag = diag;
+            return { list: normalize(store.get(K.feed, [])), live: false };
+          }
+
+          /* ---------- JazzDrive: share link se direct video URL ---------- */
+          function hashFromUrl(u) { const m = String(u || '').match(/\/share\/([A-Za-z0-9_-]+)/); return m ? m[1] : ''; }
+          function findStr(o, test) {
+            if (typeof o === 'string') return test(o) ? o : '';
+            if (o && typeof o === 'object') { for (const k of Object.keys(o)) { const r = findStr(o[k], test); if (r) return r; } }
+            return '';
+          }
+          function findVideoUrl(data) {
+            return findStr(data, (s) => /^https?:\/\//.test(s) && s.includes('/sapi/download/video'))
+                || findStr(data, (s) => /^https?:\/\//.test(s) && s.includes('/sapi/download/') && !/thumb/i.test(s));
+          }
+          function findPoster(data) { return findStr(data, (s) => /^https?:\/\//.test(s) && s.includes('/sapi/download/') && /thumb/i.test(s)); }
+
+          const directCache = {};
+          async function resolveDirect(item, force) {
+            if (item.direct) return { url: item.direct, poster: item.thumb || '' };
+            const hash = hashFromUrl(item.url);
+            if (!hash) throw new Error('share link nahi');
+            if (!force && directCache[hash]) return directCache[hash];
+            const api = JD + '/sapi/media/set?action=get&items=true&thumbnaildimensions=true&shared=true&key=' + encodeURIComponent(hash);
+            const r = await fetch(api, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Accept': '*/*', 'Referer': JD + '/share/' + hash, 'Origin': JD },
+              body: JSON.stringify({ data: {} })
+            });
+            if (!r.ok) throw new Error('API HTTP ' + r.status);
+            const txt = await r.text();
+            let data; try { data = JSON.parse(txt); } catch (e) { throw new Error('API jawab samajh nahi aaya'); }
+            const url = findVideoUrl(data);
+            if (!url) throw new Error('video link jawab mein nahi mila');
+            const res = { url, poster: findPoster(data) };
+            directCache[hash] = res;
+            return res;
+          }
+
+          function timeAgo(iso) {
+            const t = Date.parse(iso); if (!t) return '';
+            const m = Math.floor((Date.now() - t) / 60000);
+            if (m < 60) return Math.max(m, 1) + ' min pehle';
+            if (m < 1440) return Math.floor(m / 60) + ' ghante pehle';
+            return Math.floor(m / 1440) + ' din pehle';
+          }
+          function gradientFor(s) {
+            let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
+            return 'linear-gradient(160deg, hsl(' + h + ',45%,18%), hsl(' + ((h + 50) % 360) + ',50%,7%))';
+          }
+          function openItem(item) {                      // fallback: JazzDrive ka page
+            seen.add(item.url); store.set(K.seen, Array.from(seen));
+            store.set(K.ret, item.url);
+            location.href = item.url;
+          }
+          function visibleItems() {
+            let l = items;
+            if (tab === 'unseen') l = l.filter((x) => !seen.has(x.url));
+            else if (tab === 'saved') l = l.filter((x) => saved.has(x.url));
+            const q = query.trim().toLowerCase();
+            if (q) l = l.filter((x) => (x.title + ' ' + x.platform).toLowerCase().includes(q));
+            return l;
+          }
+
+          /* ---------- Actions: save / download / share / speed ---------- */
+          function plugin(name) { try { return window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins[name]; } catch (e) { return null; } }
+
+          function refreshSaveButtons() {
+            document.querySelectorAll('.slide').forEach((s) => {
+              const b = s.querySelector('.ab.like'); if (b) b.classList.toggle('on', saved.has(s._item.url));
+            });
+          }
+          function toggleSave(item, forceOn) {
+            const had = saved.has(item.url);
+            if (forceOn && had) return;
+            if (had) { saved.delete(item.url); toast('Saved se hata diya'); } else { saved.add(item.url); toast('Saved'); }
+            store.set(K.saved, Array.from(saved));
+            refreshSaveButtons();
+            if (tab === 'saved' && had) render(null);
+          }
+          function safeName(t) { return (String(t).replace(/[\\/:*?"<>|#\n\r]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60) || 'video'); }
+
+          async function downloadItem(item, btn) {
+            if (btn && btn.classList.contains('busy')) { toast('Download pehle se chal raha hai'); return; }
+            if (btn) btn.classList.add('busy');
+            try {
+              toast('Download shuru...');
+              const res = await resolveDirect(item);
+              const name = 'ZeroFeed/' + safeName(item.title) + '_' + String(Date.now()).slice(-5) + '.mp4';
+              const FS = plugin('Filesystem');
+              if (!FS || !FS.downloadFile) { window.open(res.url, '_blank'); toast('Browser mein download khul gaya'); return; }
+              let lastPct = -1;
+              try {
+                FS.addListener && FS.addListener('progress', (p) => {
+                  if (!p || !p.contentLength) return;
+                  const pct = Math.floor(p.bytes * 100 / p.contentLength);
+                  if (pct !== lastPct && pct % 5 === 0) { lastPct = pct; toast('Download ' + pct + '%', 1500); }
+                });
+              } catch (e) {}
+              let done = null, lastErr = null;
+              for (const dir of ['DOCUMENTS', 'EXTERNAL']) {
+                try {
+                  const r = await FS.downloadFile({ url: res.url, path: name, directory: dir, recursive: true, progress: true });
+                  done = { dir, path: (r && r.path) || name }; break;
+                } catch (e) { lastErr = e; }
+              }
+              if (done) toast('Download ho gayi: ' + (done.dir === 'DOCUMENTS' ? 'Documents/' : 'App folder/') + name, 4500);
+              else throw lastErr || new Error('download fail');
+            } catch (e) {
+              toast('Download fail: ' + (e && e.message ? e.message : 'error'), 4000);
+            } finally { if (btn) btn.classList.remove('busy'); }
+          }
+
+          async function shareItem(item) {
+            const SH = plugin('Share');
+            try {
+              if (SH && SH.share) { await SH.share({ title: item.title, text: item.title, url: item.url, dialogTitle: 'Share' }); return; }
+              if (navigator.share) { await navigator.share({ title: item.title, url: item.url }); return; }
+            } catch (e) { if (e && /cancel|abort/i.test(String(e.message || e.name))) return; }
+            try { await navigator.clipboard.writeText(item.url); toast('Link copy ho gaya'); } catch (e) { toast(item.url, 5000); }
+          }
+
+          function applySpeed() {
+            slides.forEach((s) => { const v = s.querySelector('video.v'); if (!s._fast) v.playbackRate = speed; });
+            document.querySelectorAll('.spdLbl').forEach((l) => { l.textContent = speed + 'x'; });
+          }
+          function cycleSpeed() {
+            const i = SPEEDS.indexOf(speed);
+            speed = SPEEDS[(i + 1) % SPEEDS.length];
+            store.set(K.speed, speed); applySpeed(); toast('Speed ' + speed + 'x', 1200);
+          }
+          function applyFit() {
+            $('feed').classList.toggle('contain', fitMode === 'contain');
+            $('fitLbl').textContent = fitMode === 'contain' ? 'Fit' : 'Fill';
+          }
+          function toggleFit() {
+            fitMode = fitMode === 'cover' ? 'contain' : 'cover';
+            store.set(K.fit, fitMode); applyFit();
+            toast(fitMode === 'cover' ? 'Fill: poori screen' : 'Fit: poori video', 1400);
+          }
+          function updateSoundButtons() {
+            document.querySelectorAll('.ab.snd').forEach((b) => {
+              b.querySelector('i').innerHTML = soundOn ? ICON.volOn : ICON.volOff;
+              b.querySelector('span').textContent = soundOn ? 'Sound' : 'Muted';
+            });
+          }
+          function toggleSound() {
+            soundOn = !soundOn; store.set(K.sound, soundOn); updateSoundButtons();
+            slides.forEach((x) => { if (x._vis) x.querySelector('video.v').muted = !soundOn; });
+          }
+
+          /* ---------- Player ---------- */
+          let observer = null;
+          let slides = [];
+
+          function setNote(s, text) { s.querySelector('.note').textContent = text || ''; }
+          function setPausedUI(s, on) { s.classList.toggle('paused', !!on); }
+          function playVideo(s) {
+            const v = s.querySelector('video.v');
+            if (!s._vis || !s._ready) return;
+            v.muted = !soundOn; v.playbackRate = speed;
+            setPausedUI(s, false);
+            const p = v.play();
+            if (p && p.catch) p.catch(() => {            // awaz ke saath chalne se roka gaya: muted chalao
+              v.muted = true; soundOn = false; updateSoundButtons();
+              v.play().catch(() => {});
+            });
+          }
+          function togglePause(s) {
+            if (s.classList.contains('failed') || !s._ready) return;
+            const v = s.querySelector('video.v');
+            if (v.paused) playVideo(s); else { v.pause(); setPausedUI(s, true); }
+          }
+          function seekBy(s, sec) {
+            const v = s.querySelector('video.v');
+            if (!s._ready || !v.duration) return;
+            v.currentTime = Math.min(Math.max(0, v.currentTime + sec), v.duration - 0.05);
+            flashMsg(s, (sec > 0 ? '+' : '') + sec + 's');
+          }
+          function flashMsg(s, html) {
+            const f = s.querySelector('.flash'); f.innerHTML = html; f.classList.add('show');
+            clearTimeout(f._t); f._t = setTimeout(() => f.classList.remove('show'), 600);
+          }
+          function heartPop(s, x, y) {
+            const h = s.querySelector('.heartpop'); h.style.left = x + 'px'; h.style.top = y + 'px';
+            h.classList.remove('go'); void h.offsetWidth; h.classList.add('go');
+          }
+          function failSlide(s, reason) {
+            s.classList.add('failed');
+            setNote(s, 'Video yahan nahi chali' + (reason ? ' (' + reason + ')' : '') + '\nNeeche ▶ se JazzDrive mein kholo');
+          }
+          async function activate(s, force) {
+            const item = s._item, v = s.querySelector('video.v');
+            if (s._ready && !force) { playVideo(s); return; }
+            if (s._loading) return;
+            s._loading = true; setNote(s, 'Video load ho rahi hai...');
+            try {
+              const res = await resolveDirect(item, force);
+              if (res.poster && !v.poster) v.poster = res.poster;
+              v.src = res.url; s._ready = true; setNote(s, '');
+              playVideo(s);
+            } catch (e) { failSlide(s, e && e.message); }
+            finally { s._loading = false; }
+            const next = slides[slides.indexOf(s) + 1];     // agli video ka link pehle se tayar rakho
+            if (next) resolveDirect(next._item).catch(() => {});
+          }
+          function releaseSlide(s) {
+            const v = s.querySelector('video.v');
+            v.pause(); setPausedUI(s, false);
+            if (s._ready) { v.removeAttribute('src'); v.load(); s._ready = false; }
+          }
+          function scrollToNext(s) {
+            const feed = $('feed'), i = slides.indexOf(s);
+            if (i >= 0 && i < slides.length - 1) feed.scrollTo({ top: (i + 1) * feed.clientHeight, behavior: 'smooth' });
+          }
+
+          function actionBtn(cls, icon, label, onclick) {
+            const b = document.createElement('button'); b.className = 'ab ' + cls;
+            b.innerHTML = '<i>' + icon + '</i><span>' + label + '</span>';
+            b.addEventListener('click', (e) => { e.stopPropagation(); onclick(b); });
+            b.addEventListener('pointerdown', (e) => e.stopPropagation());
+            return b;
+          }
+
+          function buildSlide(item, i) {
+            const s = document.createElement('section'); s.className = 'slide'; s.dataset.i = i; s._item = item;
+            const bg = document.createElement('div'); bg.className = 'bg';
+            if (item.thumb) bg.style.backgroundImage = 'url("' + item.thumb.replace(/"/g, '%22') + '")';
+            else bg.style.background = gradientFor(item.title);
+            s.appendChild(bg);
+
+            const v = document.createElement('video'); v.className = 'v';
+            v.playsInline = true; v.setAttribute('webkit-playsinline', ''); v.preload = 'none';
+            v.loop = !autoNext; v.muted = !soundOn;
+            s.appendChild(v);
+
+            const note = document.createElement('div'); note.className = 'note'; s.appendChild(note);
+            const flash = document.createElement('div'); flash.className = 'flash'; s.appendChild(flash);
+            const hp = document.createElement('div'); hp.className = 'heartpop'; hp.innerHTML = ICON.heart; s.appendChild(hp);
+            const chip = document.createElement('div'); chip.className = 'chip'; chip.textContent = '2x tez'; s.appendChild(chip);
+
+            /* pause controls (jab pause ho) */
+            const pc = document.createElement('div'); pc.className = 'pc';
+            const mk = (cls, html, fn) => { const b = document.createElement('button'); if (cls) b.className = cls; b.innerHTML = html;
+              b.addEventListener('click', (e) => { e.stopPropagation(); fn(); }); b.addEventListener('pointerdown', (e) => e.stopPropagation()); return b; };
+            pc.append(mk('', '-10', () => seekBy(s, -10)), mk('big', ICON.play, () => togglePause(s)), mk('', '+10', () => seekBy(s, 10)));
+            s.appendChild(pc);
+
+            const ov = document.createElement('div'); ov.className = 'overlay';
+            const who = document.createElement('div'); who.className = 'who'; who.textContent = item.platform;
+            const t = document.createElement('div'); t.className = 'title'; t.textContent = item.title;
+            const m = document.createElement('div'); m.className = 'meta'; m.textContent = timeAgo(item.added);
+            ov.append(who, t, m); s.appendChild(ov);
+
+            /* right side: sirf asli (kaam karne wale) buttons */
+            const side = document.createElement('div'); side.className = 'side';
+            const like = actionBtn('like' + (saved.has(item.url) ? ' on' : ''), ICON.heart, 'Save', () => toggleSave(item));
+            const dl = actionBtn('dl', ICON.down, 'Download', (b) => downloadItem(item, b));
+            const sh = actionBtn('sh', ICON.share, 'Share', () => shareItem(item));
+            const sp = actionBtn('sp', ICON.speed, '<b class="spdLbl" style="font-weight:600">' + speed + 'x</b>', cycleSpeed);
+            const sn = actionBtn('snd', soundOn ? ICON.volOn : ICON.volOff, soundOn ? 'Sound' : 'Muted', toggleSound);
+            const op = actionBtn('op', '<svg viewBox="0 0 24 24"><path d="M14 3h7v7h-2V6.4l-8.3 8.3-1.4-1.4L17.6 5H14V3zM5 5h6v2H5v12h12v-6h2v8H3V5h2z"/></svg>', 'JazzDrive', () => openItem(item));
+            side.append(like, dl, sh, sp, sn, op); s.appendChild(side);
+
+            const pl = document.createElement('button'); pl.className = 'play'; pl.innerHTML = '&#9654;';
+            pl.onclick = (e) => { e.stopPropagation(); openItem(item); }; s.appendChild(pl);
+
+            /* scrub bar */
+            const sc = document.createElement('div'); sc.className = 'scrub';
+            const tr = document.createElement('div'); tr.className = 'track';
+            const fill = document.createElement('div'); fill.className = 'fill';
+            const knob = document.createElement('div'); knob.className = 'knob'; fill.appendChild(knob); tr.appendChild(fill); sc.appendChild(tr); s.appendChild(sc);
+            const tip = document.createElement('div'); tip.className = 'tip'; s.appendChild(tip);
+
+            const setFromX = (cx) => {
+              const r = tr.getBoundingClientRect();
+              const p = Math.min(1, Math.max(0, (cx - r.left) / r.width));
+              if (v.duration) { v.currentTime = p * v.duration; fill.style.width = (p * 100) + '%'; tip.textContent = fmt(v.currentTime) + ' / ' + fmt(v.duration); }
+            };
+            sc.addEventListener('pointerdown', (e) => { e.stopPropagation(); if (!s._ready) return; try { sc.setPointerCapture(e.pointerId); } catch (x) {}
+              s._scrub = true; s.classList.add('scrubbing'); setFromX(e.clientX); });
+            sc.addEventListener('pointermove', (e) => { if (s._scrub) setFromX(e.clientX); });
+            const endScrub = () => { s._scrub = false; s.classList.remove('scrubbing'); };
+            sc.addEventListener('pointerup', endScrub); sc.addEventListener('pointercancel', endScrub);
+            sc.addEventListener('click', (e) => e.stopPropagation());
+
+            v.addEventListener('timeupdate', () => {
+              if (v.duration && !s._scrub) fill.style.width = (v.currentTime * 100 / v.duration) + '%';
+              if (v.currentTime > 3 && !seen.has(item.url)) { seen.add(item.url); store.set(K.seen, Array.from(seen)); }
+            });
+            v.addEventListener('ended', () => { if (autoNext) scrollToNext(s); });
+            v.addEventListener('error', () => {
+              if (!s._ready) return;
+              if (!s._retried) { s._retried = true; s._ready = false; activate(s, true); }   // token purana ho to naya lo
+              else failSlide(s, 'format/network');
+            });
+
+            /* tap = pause/play | double tap: left -10s, right +10s, beech mein save | dabaye rakho = 2x */
+            let lastTap = 0, tapTimer = null, lpTimer = null, savedRate = 1;
+            const stopFast = () => { clearTimeout(lpTimer); if (s._fast) { s._fast = false; s.classList.remove('fast'); v.playbackRate = speed; } };
+            s.addEventListener('pointerdown', (e) => {
+              if (e.target.closest('button,.scrub')) return;
+              s._lp = false; clearTimeout(lpTimer);
+              lpTimer = setTimeout(() => {
+                if (!s._ready || v.paused) return;
+                s._lp = true; s._fast = true; s.classList.add('fast'); v.playbackRate = 2;
+              }, 450);
+            });
+            ['pointerup', 'pointercancel', 'pointerleave'].forEach((ev) => s.addEventListener(ev, stopFast));
+            s.addEventListener('click', (e) => {
+              if (e.target.closest('button,.scrub')) return;
+              if (s._lp) { s._lp = false; return; }
+              const r = s.getBoundingClientRect(), x = (e.clientX - r.left) / r.width, now = Date.now();
+              if (now - lastTap < 280) {
+                clearTimeout(tapTimer); lastTap = 0;
+                if (x < 0.34) seekBy(s, -10);
+                else if (x > 0.66) seekBy(s, 10);
+                else { toggleSave(item, true); heartPop(s, e.clientX - r.left, e.clientY - r.top); }
+              } else {
+                lastTap = now;
+                tapTimer = setTimeout(() => { lastTap = 0; togglePause(s); }, 280);
+              }
+            });
+            return s;
+          }
+
+          function render(scrollToUrl) {
+            const feed = $('feed');
+            if (observer) observer.disconnect();
+            slides.forEach(releaseSlide);
+            feed.innerHTML = ''; slides = [];
+            const list = visibleItems();
+            applyFit();
+            $('empty').style.display = list.length ? 'none' : 'flex';
+            feed.style.display = list.length ? '' : 'none';
+            if (!list.length) {
+              let msg;
+              if (query.trim()) msg = 'Koi video nahi mili.';
+              else if (tab === 'saved') msg = 'Abhi koi saved video nahi.\nVideo par double tap (beech mein) ya Save dabao.';
+              else if (tab === 'unseen') msg = 'Sab videos dekh li!';
+              else msg = 'Abhi feed khali hai.\n\n' + lastDiag.join('\n') + '\n\nTelegram bot ko link bhejo, phir neeche Refresh dabao.';
+              $('empty').textContent = msg;
+              return;
+            }
+            observer = new IntersectionObserver((entries) => {
+              entries.forEach((en) => {
+                const s = en.target;
+                if (en.isIntersecting && en.intersectionRatio > 0.6) { s._vis = true; activate(s, false); }
+                else {
+                  s._vis = false;
+                  if (!en.isIntersecting || en.intersectionRatio < 0.1) releaseSlide(s);
+                  else s.querySelector('video.v').pause();
+                }
+              });
+            }, { root: feed, threshold: [0, 0.1, 0.6, 1] });
+            list.forEach((item, i) => { const s = buildSlide(item, i); slides.push(s); feed.appendChild(s); observer.observe(s); });
+            updateSoundButtons(); applySpeed();
+            if (scrollToUrl) {
+              const idx = list.findIndex((x) => x.url === scrollToUrl);
+              const target = Math.min(idx + 1, list.length - 1);
+              if (idx >= 0) requestAnimationFrame(() => feed.scrollTo({ top: target * feed.clientHeight, behavior: 'instant' }));
+            }
+          }
+
+          async function refresh(silent) {
+            if (!silent) toast('Feed refresh ho rahi hai...');
+            const { list, live } = await loadFeed();
+            items = list;
+            render(null);
+            if (!silent) toast(live ? 'Feed update ho gayi' : 'Feed load nahi hui (' + lastDiag.slice(1).join(', ') + ')');
+          }
+
+          /* ---------- Tabs / search / nav ---------- */
+          document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => {
+            tab = b.dataset.tab;
+            document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('on', x === b));
+            render(null);
+          }));
+          $('srchBtn').onclick = () => { $('top').classList.add('searching'); setTimeout(() => $('srchIn').focus(), 50); };
+          let srchT = null;
+          $('srchIn').addEventListener('input', () => { clearTimeout(srchT); srchT = setTimeout(() => { query = $('srchIn').value; render(null); }, 300); });
+          $('srchX').onclick = () => { $('srchIn').value = ''; $('srchIn').blur(); $('top').classList.remove('searching'); if (query) { query = ''; render(null); } };
+          $('nbHome').onclick = () => { $('feed').scrollTo({ top: 0, behavior: 'smooth' }); };
+          $('nbRef').onclick = () => refresh(false);
+          $('nbFit').onclick = toggleFit;
+
+          /* ---------- Settings sheet ---------- */
+          function openSheet() { buildSheet(); $('shade').style.display = 'block'; requestAnimationFrame(() => $('sheet').classList.add('open')); }
+          function closeSheet() { $('sheet').classList.remove('open'); setTimeout(() => { $('shade').style.display = 'none'; }, 200); }
+          function row(label, value, fn, cls) {
+            const b = document.createElement('button'); b.className = 'row' + (cls ? ' ' + cls : '');
+            b.innerHTML = '<span>' + label + '</span><span>' + (value || '') + '</span>';
+            b.onclick = () => { fn(); buildSheet(); }; return b;
+          }
+          function buildSheet() {
+            const body = $('sheetBody'); body.innerHTML = '';
+            body.append(
+              row('Video size', fitMode === 'cover' ? 'Fill (poori screen)' : 'Fit (poori video)', toggleFit),
+              row('Speed', speed + 'x', cycleSpeed),
+              row('Awaz', soundOn ? 'On' : 'Muted', toggleSound),
+              row('Auto-next', autoNext ? 'On: khatam to agli' : 'Off: loop', () => {
+                autoNext = !autoNext; store.set(K.next, autoNext); slides.forEach((s) => { s.querySelector('video.v').loop = !autoNext; });
+              }),
+              row('Feed URL', store.get(K.url, '') ? 'Custom' : 'Default', () => {
+                const u = prompt('Feed.json ka URL (khali chhodo = default):', store.get(K.url, ''));
+                if (u !== null) { if (u.trim()) store.set(K.url, u.trim()); else store.del(K.url); closeSheet(); refresh(false); }
+              }),
+              row('Dekhi hui videos reset', '', () => { seen = new Set(); store.set(K.seen, []); toast('Reset ho gaya'); if (tab === 'unseen') render(null); }),
+              row('Saved videos saaf karo', '', () => { saved = new Set(); store.set(K.saved, []); refreshSaveButtons(); toast('Saved saaf'); if (tab === 'saved') render(null); }, 'danger')
+            );
+          }
+          $('nbSet').onclick = openSheet;
+          $('shade').onclick = closeSheet;
+
+          /* ---------- Start ---------- */
+          applyFit();
+          (async () => {
+            const cached = normalize(store.get(K.feed, []));
+            const back = store.get(K.ret, null); store.del(K.ret);
+            if (cached.length) { items = cached; render(back); }
+            const { list, live } = await loadFeed();
+            if (live) { items = list; render(back || null); }
+            else if (!cached.length) { items = list; render(null); toast('Feed load nahi hui — internet check karo'); }
+          })();
+          </script>
+          </body>
+          </html>
+          ZF_EOF
+
+      - name: Install Capacitor and add Android project
+        working-directory: zerofeed-app
+        run: |
+          npm install
+          npx cap add android
+
+      - name: Patch Android manifest (download permission)
+        working-directory: zerofeed-app
+        run: |
+          python3 - <<'PY'
+          p = "android/app/src/main/AndroidManifest.xml"
+          s = open(p, encoding="utf-8").read()
+          if "WRITE_EXTERNAL_STORAGE" not in s:
+              s = s.replace("<application", '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />\n    <application', 1)
+          if "requestLegacyExternalStorage" not in s:
+              s = s.replace("<application", '<application android:requestLegacyExternalStorage="true"', 1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("manifest patched")
+          PY
+
+      - name: App icon (optional)
+        working-directory: zerofeed-app
+        continue-on-error: true
+        run: |
+          pip install pillow
+          python make_icon.py
+
+      - name: Sync web assets
+        working-directory: zerofeed-app
+        run: npx cap sync android
+
+      - name: Android SDK licenses and platform
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" > /dev/null || true
+
+      - name: Build debug APK
+        working-directory: zerofeed-app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Collect APK
+        run: cp zerofeed-app/android/app/build/outputs/apk/debug/app-debug.apk ZeroFeed.apk
+
+      - name: Save APK as artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZeroFeed-APK
+          path: ZeroFeed.apk
+          if-no-files-found: warn
+
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: zerofeed-apk
+          name: ZeroFeed APK (latest)
+          body: "Sab se naya ZeroFeed APK (v2.0). Purana app uninstall karke naya install karo (Install unknown apps allow karna padega)."
+          files: ZeroFeed.apk
